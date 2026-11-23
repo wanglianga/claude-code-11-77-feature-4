@@ -108,6 +108,35 @@ public class TokenBucketService {
         });
     }
 
+    /**
+     * 容量画像生效上限 → 桶补充速率的同步：
+     * 速率 ≤ 0 时冻结（不放行、不补充）；速率 > 0 时解冻并按该速率渐进补充。
+     */
+    @Transactional
+    public void syncRate(String dependencyCode, int rate) {
+        bucketRepository.findById(dependencyCode).ifPresent(b -> {
+            b.setRefillPerTick(Math.max(0, rate));
+            if (rate <= 0 && !b.isFrozen()) {
+                b.setFrozen(true);
+                b.setFrozenAt(Instant.now());
+            } else if (rate > 0 && b.isFrozen()) {
+                b.setFrozen(false);
+                b.setFrozenAt(null);
+                b.setLastRefillAt(Instant.now());
+            }
+            bucketRepository.save(b);
+        });
+    }
+
+    /** 本周期可投放槽位快照：桶不存在或已冻结时为 0 */
+    public int available(String dependencyCode) {
+        TokenBucket b = bucketRepository.findById(dependencyCode).orElse(null);
+        if (b == null || b.isFrozen()) {
+            return 0;
+        }
+        return b.getTokens();
+    }
+
     public List<TokenBucket> list() {
         return bucketRepository.findAll();
     }

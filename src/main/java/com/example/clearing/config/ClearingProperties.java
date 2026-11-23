@@ -14,6 +14,7 @@ public class ClearingProperties {
     private Backoff backoff = new Backoff();
     private Storm storm = new Storm();
     private Coordinator coordinator = new Coordinator();
+    private Capacity capacity = new Capacity();
 
     /** 依赖本地令牌桶配置：dependencyCode -> 桶规格 */
     private Map<String, BucketSpec> buckets = new LinkedHashMap<>();
@@ -56,6 +57,14 @@ public class ClearingProperties {
 
     public void setCoordinator(Coordinator coordinator) {
         this.coordinator = coordinator;
+    }
+
+    public Capacity getCapacity() {
+        return capacity;
+    }
+
+    public void setCapacity(Capacity capacity) {
+        this.capacity = capacity;
     }
 
     public Map<String, BucketSpec> getBuckets() {
@@ -188,6 +197,206 @@ public class ClearingProperties {
 
         public void setRefillPerTick(int refillPerTick) {
             this.refillPerTick = refillPerTick;
+        }
+    }
+
+    /** 容量画像与降级/恢复编排配置（路线 A：声明上限为硬边界，自动化调节不越界） */
+    public static class Capacity {
+        /** 依赖容量画像：dependencyCode -> 画像规格 */
+        private Map<String, ProfileSpec> profiles = new LinkedHashMap<>();
+        private Probe probe = new Probe();
+        private Escalator escalator = new Escalator();
+        private Recovery recovery = new Recovery();
+        private Deadline deadline = new Deadline();
+
+        public Map<String, ProfileSpec> getProfiles() {
+            return profiles;
+        }
+
+        public void setProfiles(Map<String, ProfileSpec> profiles) {
+            this.profiles = profiles;
+        }
+
+        public Probe getProbe() {
+            return probe;
+        }
+
+        public void setProbe(Probe probe) {
+            this.probe = probe;
+        }
+
+        public Escalator getEscalator() {
+            return escalator;
+        }
+
+        public void setEscalator(Escalator escalator) {
+            this.escalator = escalator;
+        }
+
+        public Recovery getRecovery() {
+            return recovery;
+        }
+
+        public void setRecovery(Recovery recovery) {
+            this.recovery = recovery;
+        }
+
+        public Deadline getDeadline() {
+            return deadline;
+        }
+
+        public void setDeadline(Deadline deadline) {
+            this.deadline = deadline;
+        }
+    }
+
+    /** 单个依赖的容量画像规格 */
+    public static class ProfileSpec {
+        /** 预先声明的容量上限（每周期补充速率的安全边界），自动化调节永不越过 */
+        private int declaredCeiling;
+        /** 每来源最低服务份额（队列配额控制器每周期为每个来源保留的投放槽） */
+        private int minSharePerSource = 1;
+
+        public int getDeclaredCeiling() {
+            return declaredCeiling;
+        }
+
+        public void setDeclaredCeiling(int declaredCeiling) {
+            this.declaredCeiling = declaredCeiling;
+        }
+
+        public int getMinSharePerSource() {
+            return minSharePerSource;
+        }
+
+        public void setMinSharePerSource(int minSharePerSource) {
+            this.minSharePerSource = minSharePerSource;
+        }
+    }
+
+    /** 依赖健康探针：探测预算上限（防止探测本身压垮依赖）与恢复确认阈值（抗抖动） */
+    public static class Probe {
+        /** 每个依赖每个调度周期最多探测次数 */
+        private int maxPerTickPerDep = 1;
+        /** 全部依赖每个调度周期探测总次数上限 */
+        private int maxPerTickTotal = 3;
+        /** 连续探测成功达到该次数才允许进入恢复爬坡（短暂恢复信号不被追认） */
+        private int consecutiveOkToRecover = 2;
+
+        public int getMaxPerTickPerDep() {
+            return maxPerTickPerDep;
+        }
+
+        public void setMaxPerTickPerDep(int maxPerTickPerDep) {
+            this.maxPerTickPerDep = maxPerTickPerDep;
+        }
+
+        public int getMaxPerTickTotal() {
+            return maxPerTickTotal;
+        }
+
+        public void setMaxPerTickTotal(int maxPerTickTotal) {
+            this.maxPerTickTotal = maxPerTickTotal;
+        }
+
+        public int getConsecutiveOkToRecover() {
+            return consecutiveOkToRecover;
+        }
+
+        public void setConsecutiveOkToRecover(int consecutiveOkToRecover) {
+            this.consecutiveOkToRecover = consecutiveOkToRecover;
+        }
+    }
+
+    /** 降级编排器：按连续失败周期数逐级收紧（局部限流，只作用于故障依赖自身） */
+    public static class Escalator {
+        /** 连续失败周期达到该值 → DEGRADED（生效上限减半） */
+        private int failureTicksToDegrade = 2;
+        /** 连续失败周期达到该值 → DOWN（生效上限置零、冻结本地桶、开始受预算约束的探测） */
+        private int failureTicksToDown = 3;
+        /** DEGRADED 时生效上限 = max(1, floor(declared × factor)) */
+        private double degradedFactor = 0.5;
+
+        public int getFailureTicksToDegrade() {
+            return failureTicksToDegrade;
+        }
+
+        public void setFailureTicksToDegrade(int failureTicksToDegrade) {
+            this.failureTicksToDegrade = failureTicksToDegrade;
+        }
+
+        public int getFailureTicksToDown() {
+            return failureTicksToDown;
+        }
+
+        public void setFailureTicksToDown(int failureTicksToDown) {
+            this.failureTicksToDown = failureTicksToDown;
+        }
+
+        public double getDegradedFactor() {
+            return degradedFactor;
+        }
+
+        public void setDegradedFactor(double degradedFactor) {
+            this.degradedFactor = degradedFactor;
+        }
+    }
+
+    /** 恢复节流器：保守爬坡（从小上限逐步上调至声明上限），任一探测失败即回落 */
+    public static class Recovery {
+        /** 恢复起步的生效上限 */
+        private int initialCeiling = 1;
+        /** 每驻留期满后的上调步长 */
+        private int step = 1;
+        /** 每级爬坡需要连续稳定（探测成功）的周期数 */
+        private int dwellTicks = 1;
+
+        public int getInitialCeiling() {
+            return initialCeiling;
+        }
+
+        public void setInitialCeiling(int initialCeiling) {
+            this.initialCeiling = initialCeiling;
+        }
+
+        public int getStep() {
+            return step;
+        }
+
+        public void setStep(int step) {
+            this.step = step;
+        }
+
+        public int getDwellTicks() {
+            return dwellTicks;
+        }
+
+        public void setDwellTicks(int dwellTicks) {
+            this.dwellTicks = dwellTicks;
+        }
+    }
+
+    /** 截止风险估计器：清算截止时刻与临期窗口 */
+    public static class Deadline {
+        /** 缺省清算截止：清算日当日该时刻（小时，0-23） */
+        private int cutoffHour = 20;
+        /** 距截止不足该分钟数视为临期（ urgency 系数上调） */
+        private long urgentWindowMinutes = 120;
+
+        public int getCutoffHour() {
+            return cutoffHour;
+        }
+
+        public void setCutoffHour(int cutoffHour) {
+            this.cutoffHour = cutoffHour;
+        }
+
+        public long getUrgentWindowMinutes() {
+            return urgentWindowMinutes;
+        }
+
+        public void setUrgentWindowMinutes(long urgentWindowMinutes) {
+            this.urgentWindowMinutes = urgentWindowMinutes;
         }
     }
 }

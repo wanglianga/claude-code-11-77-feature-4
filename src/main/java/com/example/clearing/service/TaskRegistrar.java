@@ -34,17 +34,20 @@ public class TaskRegistrar {
     private final ClearingProperties properties;
     private final FailureClassifier failureClassifier;
     private final EventLog eventLog;
+    private final DeadlineRiskEstimator riskEstimator;
 
     public TaskRegistrar(ClearingTaskRepository taskRepository,
             CatalogService catalogService,
             ClearingProperties properties,
             FailureClassifier failureClassifier,
-            EventLog eventLog) {
+            EventLog eventLog,
+            DeadlineRiskEstimator riskEstimator) {
         this.taskRepository = taskRepository;
         this.catalogService = catalogService;
         this.properties = properties;
         this.failureClassifier = failureClassifier;
         this.eventLog = eventLog;
+        this.riskEstimator = riskEstimator;
     }
 
     public enum Outcome {
@@ -56,9 +59,16 @@ public class TaskRegistrar {
     public record RegisterResult(Outcome outcome, ClearingTask task) {
     }
 
+    /** 兼容旧签名：未显式指定清算截止时间 */
     @Transactional
     public RegisterResult register(String batchId, LocalDate clearingDate, String businessKey,
             String billVersion, SourceType sourceType, BigDecimal amount, String payload) {
+        return register(batchId, clearingDate, businessKey, billVersion, sourceType, amount, payload, null);
+    }
+
+    @Transactional
+    public RegisterResult register(String batchId, LocalDate clearingDate, String businessKey,
+            String billVersion, SourceType sourceType, BigDecimal amount, String payload, Instant deadlineAt) {
         String contentHash = HashUtil.sha256(payload.trim());
         List<ClearingTask> siblings = taskRepository.findByBusinessKeyAndBillVersion(businessKey, billVersion);
 
@@ -73,7 +83,7 @@ public class TaskRegistrar {
         }
 
         ClearingTask task = build(batchId, clearingDate, businessKey, billVersion, sourceType, amount,
-                payload, contentHash);
+                payload, contentHash, deadlineAt);
 
         if (!siblings.isEmpty()) {
             // 同业务键同版本但内容不同 → 内容冲突，不发放令牌
@@ -91,7 +101,8 @@ public class TaskRegistrar {
         ClearingTask saved = taskRepository.save(task);
         eventLog.record(saved, Decision.REGISTERED,
                 "登记成功：批次 " + batchId + "，清算日 " + clearingDate + "，来源 " + sourceType
-                        + "，依赖版本 " + saved.getDependencyVersion() + "，金额优先级 " + bandOf(saved.getPriority()));
+                        + "，依赖版本 " + saved.getDependencyVersion() + "，金额优先级 " + bandOf(saved.getPriority())
+                        + "；" + riskEstimator.explain(saved));
         taskRepository.save(saved);
         return new RegisterResult(Outcome.CREATED, saved);
     }
@@ -109,7 +120,8 @@ public class TaskRegistrar {
     }
 
     private ClearingTask build(String batchId, LocalDate clearingDate, String businessKey,
-            String billVersion, SourceType sourceType, BigDecimal amount, String payload, String contentHash) {
+            String billVersion, SourceType sourceType, BigDecimal amount, String payload, String contentHash,
+            Instant deadlineAt) {
         ClearingTask task = new ClearingTask();
         task.setBatchId(batchId);
         task.setClearingDate(clearingDate);
@@ -123,6 +135,9 @@ public class TaskRegistrar {
         task.setPriority(priorityOf(amount));
         task.setStage(Stage.CALC);
         task.setPayload(payload);
+        // 截止风险估计：显式截止时间优先，缺省为清算日当日截止时刻
+        task.setDeadlineAt(deadlineAt != null ? deadlineAt : riskEstimator.defaultDeadline(clearingDate));
+        riskEstimator.assess(task, Instant.now());
         return task;
     }
 

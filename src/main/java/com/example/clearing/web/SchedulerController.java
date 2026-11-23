@@ -20,7 +20,8 @@ public class SchedulerController {
     }
 
     @Operation(summary = "手动执行一个调度周期",
-            description = "协调器配额 → 本地桶补充 → 等待者提升 → 投放（令牌+退避+依赖健康三者满足）→ 待确认回执查询 → 风暴观测")
+            description = "健康探针（探测上限内）→ 降级编排（局部限流）→ 恢复节流（保守爬坡）→ 截止风险刷新 → "
+                    + "本地桶补充 → 队列配额计划（每来源最低份额 + 风险序公共池）→ 投放 → 配额证据 → 风暴观测")
     @PostMapping("/tick")
     public TickResult tick() {
         return scheduler.tick();

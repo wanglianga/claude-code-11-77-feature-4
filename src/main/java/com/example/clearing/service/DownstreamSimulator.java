@@ -121,6 +121,16 @@ public class DownstreamSimulator {
         receipts.put(operationNo, Instant.now());
     }
 
+    /** 健康探针：待遇规则服务轻量探测（不产生业务调用，不消耗令牌） */
+    public boolean pingRule() {
+        return ruleMode == RuleMode.NORMAL;
+    }
+
+    /** 健康探针：基金网关轻量探测（DOWN 视为不可达；DELAYED 仍可受理） */
+    public boolean pingFund() {
+        return fundMode != FundMode.DOWN;
+    }
+
     public RuleMode getRuleMode() {
         return ruleMode;
     }

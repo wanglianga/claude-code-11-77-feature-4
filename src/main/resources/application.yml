@@ -39,9 +39,44 @@ clearing:
   coordinator:
     ticks-per-period: 10
   buckets:
+    CLEARING_DB:
+      capacity: 12
+      refill-per-tick: 6
     RULE_ENGINE:
       capacity: 6
       refill-per-tick: 2
     FUND_GW:
       capacity: 3
       refill-per-tick: 1
+  capacity:
+    # 容量画像库：预先声明的容量上限是硬安全边界，自动化调节（降级/恢复爬坡）永不越过
+    profiles:
+      CLEARING_DB:
+        declared-ceiling: 6
+        min-share-per-source: 1
+      RULE_ENGINE:
+        declared-ceiling: 2
+        min-share-per-source: 1
+      FUND_GW:
+        declared-ceiling: 1
+        min-share-per-source: 1
+    probe:
+      # 探测上限：每依赖每周期 1 次、全局每周期 3 次，探测本身绝不压垮依赖
+      max-per-tick-per-dep: 1
+      max-per-tick-total: 3
+      # 连续 2 次探测成功才允许恢复爬坡（短暂恢复信号不被追认）
+      consecutive-ok-to-recover: 2
+    escalator:
+      # 连续失败周期 2 → 降级（上限减半），3 → 熔断（置零+冻结），只收紧故障依赖自身
+      failure-ticks-to-degrade: 2
+      failure-ticks-to-down: 3
+      degraded-factor: 0.5
+    recovery:
+      # 保守恢复：从 1/周期起步，每稳定 1 个周期 +1，直至声明上限；任何失败立即回落
+      initial-ceiling: 1
+      step: 1
+      dwell-ticks: 1
+    deadline:
+      # 缺省清算截止：清算日 20:00；距截止 120 分钟内视为临期
+      cutoff-hour: 20
+      urgent-window-minutes: 120

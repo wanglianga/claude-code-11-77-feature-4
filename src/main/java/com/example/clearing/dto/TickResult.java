@@ -9,6 +9,7 @@ public class TickResult {
     public int promoted;
     public int dispatched;
     public int throttled;
+    public int quotaDenied;
     public int waitingDependency;
     public int waitingReceipt;
     public int confirmed;
@@ -26,6 +27,10 @@ public class TickResult {
 
     public int getThrottled() {
         return throttled;
+    }
+
+    public int getQuotaDenied() {
+        return quotaDenied;
     }
 
     public int getWaitingDependency() {

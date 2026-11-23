@@ -1,17 +1,25 @@
 package com.example.clearing.service;
 
+import com.example.clearing.domain.CapacityEvent;
+import com.example.clearing.domain.CapacityEventType;
+import com.example.clearing.domain.CapacityProfile;
 import com.example.clearing.domain.ClearingTask;
 import com.example.clearing.domain.DepHealth;
 import com.example.clearing.domain.EntryStatus;
 import com.example.clearing.domain.EntryType;
 import com.example.clearing.domain.FailureType;
 import com.example.clearing.domain.LedgerEntry;
+import com.example.clearing.domain.ProfileState;
+import com.example.clearing.domain.QuotaGrant;
 import com.example.clearing.domain.SourceType;
+import com.example.clearing.domain.Stage;
 import com.example.clearing.domain.StormReport;
 import com.example.clearing.domain.StormLevel;
 import com.example.clearing.domain.TaskStatus;
 import com.example.clearing.domain.TokenBucket;
 import com.example.clearing.dto.ScenarioResult;
+import com.example.clearing.repo.CapacityEventRepository;
+import com.example.clearing.repo.CatalogItemRepository;
 import com.example.clearing.repo.ClearingTaskRepository;
 import com.example.clearing.repo.FailureRecordRepository;
 import com.example.clearing.repo.LedgerEntryRepository;
@@ -19,7 +27,9 @@ import com.example.clearing.repo.QuotaGrantRepository;
 import com.example.clearing.repo.StormReportRepository;
 import com.example.clearing.repo.TaskEventRepository;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.function.BooleanSupplier;
 import org.springframework.stereotype.Service;
@@ -27,12 +37,19 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * 验收样本：医院批次、药店回传、目录冲突、接口降级与配额恢复、
- * 基金回执延迟、内容冲突、风暴观测。每个场景通过真实服务执行并输出断言。
+ * 基金回执延迟、内容冲突、风暴观测，以及月末积压容量治理四场景
+ * （局部限流 / 可追溯插队与插队保护 / 低风险最低服务 / 探测上限与保守恢复）。
+ * 每个场景通过真实服务执行并输出断言。
  */
 @Service
 public class DemoScenarioService {
 
     private static final LocalDate CLEARING_DATE = LocalDate.of(2026, 11, 23);
+    /** 月末积压场景统一使用的清算日（月末） */
+    private static final LocalDate MONTH_END = LocalDate.of(2026, 11, 30);
+    /** 目录基线（启动种子），演练复位时恢复到此集合 */
+    private static final java.util.Set<String> BASELINE_CATALOG =
+            java.util.Set.of("A-001", "B-002", "C-003", "D-004");
 
     private final TaskRegistrar registrar;
     private final ClearingScheduler scheduler;
@@ -43,12 +60,16 @@ public class DemoScenarioService {
     private final LedgerService ledgerService;
     private final ManualResolutionService manualResolution;
     private final StormObserver stormObserver;
+    private final CapacityProfileService profileService;
+    private final DegradationOrchestrator orchestrator;
     private final ClearingTaskRepository taskRepository;
     private final LedgerEntryRepository ledgerRepository;
     private final TaskEventRepository eventRepository;
     private final FailureRecordRepository failureRepository;
     private final StormReportRepository stormRepository;
     private final QuotaGrantRepository quotaRepository;
+    private final CapacityEventRepository capacityEventRepository;
+    private final CatalogItemRepository catalogItemRepository;
 
     public DemoScenarioService(TaskRegistrar registrar,
             ClearingScheduler scheduler,
@@ -59,12 +80,16 @@ public class DemoScenarioService {
             LedgerService ledgerService,
             ManualResolutionService manualResolution,
             StormObserver stormObserver,
+            CapacityProfileService profileService,
+            DegradationOrchestrator orchestrator,
             ClearingTaskRepository taskRepository,
             LedgerEntryRepository ledgerRepository,
             TaskEventRepository eventRepository,
             FailureRecordRepository failureRepository,
             StormReportRepository stormRepository,
-            QuotaGrantRepository quotaRepository) {
+            QuotaGrantRepository quotaRepository,
+            CapacityEventRepository capacityEventRepository,
+            CatalogItemRepository catalogItemRepository) {
         this.registrar = registrar;
         this.scheduler = scheduler;
         this.bucketService = bucketService;
@@ -74,15 +99,19 @@ public class DemoScenarioService {
         this.ledgerService = ledgerService;
         this.manualResolution = manualResolution;
         this.stormObserver = stormObserver;
+        this.profileService = profileService;
+        this.orchestrator = orchestrator;
         this.taskRepository = taskRepository;
         this.ledgerRepository = ledgerRepository;
         this.eventRepository = eventRepository;
         this.failureRepository = failureRepository;
         this.stormRepository = stormRepository;
         this.quotaRepository = quotaRepository;
+        this.capacityEventRepository = capacityEventRepository;
+        this.catalogItemRepository = catalogItemRepository;
     }
 
-    /** 演练复位：清空业务数据，恢复依赖健康、令牌桶与模拟器 */
+    /** 演练复位：清空业务数据，恢复依赖健康、令牌桶、容量画像、目录基线与模拟器 */
     @Transactional
     public void reset() {
         eventRepository.deleteAll();
@@ -91,8 +120,15 @@ public class DemoScenarioService {
         quotaRepository.deleteAll();
         ledgerRepository.deleteAll();
         taskRepository.deleteAll();
+        capacityEventRepository.deleteAll();
+        // 目录恢复基线：移除演练期间同步进来的目录项（如 ZZZ-999），保证场景可重复执行
+        catalogItemRepository.deleteAll(catalogItemRepository.findAll().stream()
+                .filter(item -> !BASELINE_CATALOG.contains(item.getCode()))
+                .toList());
         bucketService.resetAll();
         graphService.resetHealth();
+        profileService.resetAll();
+        orchestrator.resetSignals();
         simulator.reset();
         stormObserver.resetWindow();
     }
@@ -107,9 +143,14 @@ public class DemoScenarioService {
             case "fund-pending-confirm" -> fundPendingConfirm();
             case "content-conflict" -> contentConflict();
             case "storm-watch" -> stormWatch();
+            case "month-end-local-throttle" -> monthEndLocalThrottle();
+            case "month-end-priority-jump" -> monthEndPriorityJump();
+            case "month-end-min-service" -> monthEndMinService();
+            case "month-end-conservative-recovery" -> monthEndConservativeRecovery();
             default -> throw new IllegalArgumentException("未知场景: " + name
                     + "，可选：hospital-batch, pharmacy-return, catalog-conflict, rule-degradation, "
-                    + "fund-pending-confirm, content-conflict, storm-watch");
+                    + "fund-pending-confirm, content-conflict, storm-watch, month-end-local-throttle, "
+                    + "month-end-priority-jump, month-end-min-service, month-end-conservative-recovery");
         };
     }
 
@@ -196,7 +237,7 @@ public class DemoScenarioService {
         TokenBucket ruleBucket = bucketService.get(TaskRegistrar.DEP_RULE);
         s.check(ruleBucket.getTokens() == 1, "B1 投放后 RULE 桶余额=1，实际=" + ruleBucket.getTokens());
 
-        s.step("待遇规则服务 DOWN（接口降级），登记批次 B2 共 5 笔");
+        s.step("待遇规则服务 DOWN（人工覆盖，接口降级），登记批次 B2 共 5 笔");
         graphService.updateHealth(TaskRegistrar.DEP_RULE, DepHealth.DOWN, "演练：规则服务不可用");
         for (int i = 1; i <= 5; i++) {
             reg("HOSP-B2-" + i, "v1", SourceType.HOSPITAL, "1000.00", payload("A-001", 1, "10.00"));
@@ -216,9 +257,9 @@ public class DemoScenarioService {
         s.check(b2Waiting, "B2 任务保持就绪等待，决策记录为 WAIT_DEPENDENCY_DOWN");
         s.check(quotaRepository.findAll().stream()
                 .anyMatch(q -> q.getDependencyCode().equals(TaskRegistrar.DEP_RULE) && q.getGranted() == 0),
-                "协调器配额证据：RULE_ENGINE 故障期间配额置零（故障隔离，仅收紧本依赖队列）");
+                "队列配额证据：RULE_ENGINE 故障期间配额置零（故障隔离，仅收紧本依赖队列）");
 
-        s.step("待遇规则服务恢复健康，执行 1 个调度周期");
+        s.step("待遇规则服务恢复健康（人工覆盖），执行 1 个调度周期");
         graphService.updateHealth(TaskRegistrar.DEP_RULE, DepHealth.HEALTHY, "演练：规则服务恢复");
         scheduler.tick();
         TokenBucket afterHeal = bucketService.get(TaskRegistrar.DEP_RULE);
@@ -227,7 +268,7 @@ public class DemoScenarioService {
                         + afterHeal.getTotalRefilled() + "（故障前 " + refilledAtDown + "）");
         long b2CalcDone = taskRepository.findAll().stream()
                 .filter(t -> t.getBusinessKey().startsWith("HOSP-B2-"))
-                .filter(t -> t.getStage() != com.example.clearing.domain.Stage.CALC)
+                .filter(t -> t.getStage() != Stage.CALC)
                 .count();
         s.check(b2CalcDone == 3, "恢复后首个周期仅投放 3 笔（冻结余额 1 + 补充 2），实际=" + b2CalcDone);
 
@@ -338,11 +379,308 @@ public class DemoScenarioService {
         return s;
     }
 
+    /**
+     * 场景 8（月末积压）：基金接口错误而数据库健康 → 局部限流。
+     * 基金网关故障被降级编排器逐级收紧（DEGRADED→DOWN 熔断），
+     * 期间清算数据库与待遇规则服务照常推进新任务，故障只收紧基金自身队列。
+     */
+    private ScenarioResult monthEndLocalThrottle() {
+        ScenarioResult s = new ScenarioResult("month-end-local-throttle");
+        reset();
+        s.step("月末积压：基金网关开始报错（模拟器 DOWN），登记 6 笔月末医院清单（清算日 " + MONTH_END + "）");
+        simulator.setFundMode(DownstreamSimulator.FundMode.DOWN);
+        for (int i = 1; i <= 6; i++) {
+            regMonthEnd("ME-LT-" + i, SourceType.HOSPITAL, "30000.00", null);
+        }
+        s.step("周期1：6 笔完成待遇计算（RULE 6→0、清算库 12→6），3 笔基金回传尝试失败");
+        scheduler.tick();
+        s.step("周期2-3：基金回传继续失败（每周期 1 次），降级编排器记录连续失败周期");
+        scheduler.tick();
+        scheduler.tick();
+        s.step("周期4：降级编排器将 FUND_GW 熔断（生效上限 0、冻结桶），其余依赖不受影响");
+        scheduler.tick();
+        CapacityProfile fundProfile = profileService.get(TaskRegistrar.DEP_FUND);
+        s.check(fundProfile.getState() == ProfileState.DOWN && fundProfile.getEffectiveCeiling() == 0,
+                "局部限流：FUND_GW 画像 DOWN、生效上限 0，实际=" + fundProfile.getState() + "/"
+                        + fundProfile.getEffectiveCeiling());
+        s.check(bucketService.get(TaskRegistrar.DEP_FUND).isFrozen(), "FUND_GW 本地令牌桶已冻结");
+        CapacityProfile dbProfile = profileService.get(DependencyHealthProbe.DEP_DB);
+        CapacityProfile ruleProfile = profileService.get(TaskRegistrar.DEP_RULE);
+        s.check(dbProfile.getState() == ProfileState.NORMAL && ruleProfile.getState() == ProfileState.NORMAL,
+                "数据库与待遇规则画像保持 NORMAL（故障不扩散），实际=" + dbProfile.getState() + "/"
+                        + ruleProfile.getState());
+        boolean noClampOnOthers = capacityEventRepository.findAll().stream()
+                .filter(e -> e.getEventType() == CapacityEventType.ENTER_DOWN
+                        || e.getEventType() == CapacityEventType.ENTER_DEGRADED)
+                .allMatch(e -> e.getDependencyCode().equals(TaskRegistrar.DEP_FUND));
+        s.check(noClampOnOthers, "容量事件审计：降级/熔断事件只作用于 FUND_GW，未波及其他依赖");
+        long fundConsumedAtDown = bucketService.get(TaskRegistrar.DEP_FUND).getTotalConsumed();
+        long ruleConsumedAtDown = bucketService.get(TaskRegistrar.DEP_RULE).getTotalConsumed();
+        long dbConsumedAtDown = bucketService.get(DependencyHealthProbe.DEP_DB).getTotalConsumed();
+
+        s.step("基金故障期间：再登记 3 笔月末清单并执行 1 个调度周期");
+        for (int i = 7; i <= 9; i++) {
+            regMonthEnd("ME-LT-" + i, SourceType.HOSPITAL, "30000.00", null);
+        }
+        scheduler.tick();
+        long ruleDelta = bucketService.get(TaskRegistrar.DEP_RULE).getTotalConsumed() - ruleConsumedAtDown;
+        long dbDelta = bucketService.get(DependencyHealthProbe.DEP_DB).getTotalConsumed() - dbConsumedAtDown;
+        s.check(ruleDelta == 3 && dbDelta == 3,
+                "基金熔断期间数据库与规则服务继续推进：RULE 消耗 +" + ruleDelta + "、清算库消耗 +" + dbDelta
+                        + "（各应为 +3）");
+        s.check(bucketService.get(TaskRegistrar.DEP_FUND).getTotalConsumed() == fundConsumedAtDown,
+                "基金熔断期间 FUND_GW 零投放（令牌消耗保持 " + fundConsumedAtDown + "），基金接口得到保护");
+        long newCalcDone = taskRepository.findAll().stream()
+                .filter(t -> t.getBusinessKey().matches("ME-LT-[789]"))
+                .filter(t -> t.getStage() == Stage.RETURN)
+                .count();
+        s.check(newCalcDone == 3, "新登记 3 笔在基金故障期间完成待遇计算进入回传阶段，实际=" + newCalcDone);
+        s.check(capacityEventRepository.findAll().stream()
+                .anyMatch(e -> e.getDependencyCode().equals(TaskRegistrar.DEP_FUND)
+                        && e.getEventType() == CapacityEventType.ENTER_DOWN),
+                "容量事件审计记录 FUND_GW 熔断（ENTER_DOWN）");
+        return s;
+    }
+
+    /**
+     * 场景 9（月末积压）：高金额临期任务到达 → 可追溯插队 + 插队保护。
+     * 高金额临期任务按截止风险分排前并消耗公共池配额（证据可查），
+     * 但低风险来源的每来源保留份额不被侵占（最低服务保障）。
+     */
+    private ScenarioResult monthEndPriorityJump() {
+        ScenarioResult s = new ScenarioResult("month-end-priority-jump");
+        reset();
+        s.step("月末积压：登记 6 笔医院清单排空 RULE 桶（容量 6），执行 1 个周期");
+        for (int i = 1; i <= 6; i++) {
+            regMonthEnd("ME-PJ-W" + i, SourceType.HOSPITAL, "20000.00", null);
+        }
+        scheduler.tick();
+        s.step("登记 2 笔低风险药店清单（金额 500），执行 1 个周期（RULE 补充 2，全部消耗）");
+        regMonthEnd("ME-PJ-P1", SourceType.PHARMACY, "500.00", null);
+        regMonthEnd("ME-PJ-P2", SourceType.PHARMACY, "500.00", null);
+        scheduler.tick();
+        s.check(bucketService.get(TaskRegistrar.DEP_RULE).getTokens() == 0,
+                "RULE 桶已排空，实际余额=" + bucketService.get(TaskRegistrar.DEP_RULE).getTokens());
+        s.step("再执行 1 个空周期让桶补充到 2（无新登记）");
+        scheduler.tick();
+        s.step("低风险药店队列积压 3 笔；随后 3 笔高金额临期医院任务到达（金额 90000，截止 30 分钟后）");
+        regMonthEnd("ME-PJ-Q1", SourceType.PHARMACY, "500.00", null);
+        regMonthEnd("ME-PJ-Q2", SourceType.PHARMACY, "500.00", null);
+        regMonthEnd("ME-PJ-Q3", SourceType.PHARMACY, "500.00", null);
+        Instant urgent = Instant.now().plus(30, ChronoUnit.MINUTES);
+        regMonthEnd("ME-PJ-U1", SourceType.HOSPITAL, "90000.00", urgent);
+        regMonthEnd("ME-PJ-U2", SourceType.HOSPITAL, "90000.00", urgent);
+        regMonthEnd("ME-PJ-U3", SourceType.HOSPITAL, "90000.00", urgent);
+        ClearingTask urgent1 = taskOf("ME-PJ-U1");
+        s.check(urgent1.getRiskScore() == 9.0 && "CRITICAL".equals(urgent1.getRiskBand()),
+                "截止风险估计：高金额临期任务风险分 9.0（金额HIGH×临期×3）、风险带 CRITICAL，实际="
+                        + urgent1.getRiskScore() + "/" + urgent1.getRiskBand());
+
+        s.step("执行 1 个调度周期（RULE 补充 2 → 可用槽位 4：医院保留 1 + 药店保留 1 + 公共池 2）");
+        scheduler.tick();
+        long urgentCalcDone = countByPrefixCalcDone("ME-PJ-U");
+        long pharmacyCalcDone = countByPrefixCalcDone("ME-PJ-Q");
+        s.check(urgentCalcDone == 3, "3 笔高金额临期任务全部于本周期完成待遇计算（可追溯插队），实际=" + urgentCalcDone);
+        s.check(pharmacyCalcDone == 1, "低风险药店来源本周期仍推进 1 笔（保留份额被保护），实际=" + pharmacyCalcDone);
+        List<QuotaGrant> grants = quotaRepository.findAll().stream()
+                .filter(q -> q.getDependencyCode().equals(TaskRegistrar.DEP_RULE))
+                .filter(q -> q.getPeriodLabel().equals(latestPeriodLabel()))
+                .toList();
+        QuotaGrant hospGrant = grants.stream()
+                .filter(q -> q.getSourceType().equals("HOSPITAL")).findFirst().orElseThrow();
+        QuotaGrant pharmGrant = grants.stream()
+                .filter(q -> q.getSourceType().equals("PHARMACY")).findFirst().orElseThrow();
+        s.check(hospGrant.getReservedGranted() == 1 && hospGrant.getBonusGranted() == 2
+                && hospGrant.getMaxRiskScore() == 9.0,
+                "配额证据：医院来源保留授予 1 + 公共池授予 2（最高风险分 9.0），实际="
+                        + hospGrant.getReservedGranted() + "+" + hospGrant.getBonusGranted() + "/"
+                        + hospGrant.getMaxRiskScore());
+        s.check(pharmGrant.getReservedGranted() == 1 && pharmGrant.getBonusGranted() == 0,
+                "插队保护：药店来源保留授予 1 未被医院侵占（公共池 0），实际="
+                        + pharmGrant.getReservedGranted() + "+" + pharmGrant.getBonusGranted());
+        boolean urgentEventTraceable = eventRepository.findByTaskIdOrderByCreatedAtAsc(urgent1.getId()).stream()
+                .anyMatch(e -> e.getReason() != null && e.getReason().contains("风险分 9.0"));
+        s.check(urgentEventTraceable, "高金额临期任务的投放事件记录风险分与配额来源（优先级可追溯）");
+        boolean pharmacyThrottled = taskRepository.findAll().stream()
+                .filter(t -> t.getBusinessKey().matches("ME-PJ-Q[23]"))
+                .anyMatch(t -> t.getLastDecision() == com.example.clearing.domain.Decision.THROTTLED);
+        s.check(pharmacyThrottled, "未获配额的药店任务记录 THROTTLED（配额耗尽等待下周期），决策可复核");
+        s.step("继续调度直至全部完成");
+        tickUntil(20, () -> taskRepository.findAll().stream()
+                .allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED));
+        s.check(taskRepository.findAll().stream().allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED),
+                "全部任务最终 CONFIRMED");
+        return s;
+    }
+
+    /**
+     * 场景 10（月末积压）：低风险来源队列长期积压 → 每来源最低服务份额。
+     * 高金额临期任务持续占满公共池期间，低风险药店来源每个周期至少推进 1 笔，
+     * 永不挂零（不被永久饿死），配额证据逐周期可查。
+     */
+    private ScenarioResult monthEndMinService() {
+        ScenarioResult s = new ScenarioResult("month-end-min-service");
+        reset();
+        s.step("月末积压：登记 6 笔医院清单排空 RULE 桶，执行 1 个周期");
+        for (int i = 1; i <= 6; i++) {
+            regMonthEnd("ME-MS-W" + i, SourceType.HOSPITAL, "20000.00", null);
+        }
+        scheduler.tick();
+        s.step("低风险药店来源积压 5 笔（金额 300），同时 5 笔高金额临期医院任务（90000，截止 30 分钟后）持续竞争");
+        for (int i = 1; i <= 5; i++) {
+            regMonthEnd("ME-MS-P" + i, SourceType.PHARMACY, "300.00", null);
+        }
+        Instant urgent = Instant.now().plus(30, ChronoUnit.MINUTES);
+        for (int i = 1; i <= 5; i++) {
+            regMonthEnd("ME-MS-H" + i, SourceType.HOSPITAL, "90000.00", urgent);
+        }
+        boolean minServiceEveryTick = true;
+        StringBuilder progress = new StringBuilder();
+        for (int tick = 1; tick <= 5; tick++) {
+            long before = countByPrefixCalcDone("ME-MS-P");
+            scheduler.tick();
+            long after = countByPrefixCalcDone("ME-MS-P");
+            progress.append("周期").append(tick).append("+").append(after - before).append(" ");
+            if (after - before < 1) {
+                minServiceEveryTick = false;
+            }
+        }
+        s.check(minServiceEveryTick,
+                "最低服务：高风险竞争下低风险药店来源连续 5 个周期每周期至少推进 1 笔（" + progress + "）");
+        s.check(countByPrefixCalcDone("ME-MS-P") == 5,
+                "5 笔低风险任务按最低服务份额全部完成待遇计算，实际=" + countByPrefixCalcDone("ME-MS-P"));
+        long pharmacyReservedGrants = quotaRepository.findAll().stream()
+                .filter(q -> q.getDependencyCode().equals(TaskRegistrar.DEP_RULE))
+                .filter(q -> q.getSourceType().equals("PHARMACY"))
+                .mapToInt(QuotaGrant::getReservedGranted)
+                .sum();
+        s.check(pharmacyReservedGrants >= 5,
+                "配额证据：药店来源保留份额授予累计 " + pharmacyReservedGrants
+                        + "（≥5，每周期最低服务份额可追溯）");
+        s.step("继续调度直至全部完成");
+        tickUntil(25, () -> taskRepository.findAll().stream()
+                .allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED));
+        s.check(taskRepository.findAll().stream().allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED),
+                "全部任务最终 CONFIRMED（低风险来源未被永久饿死）");
+        return s;
+    }
+
+    /**
+     * 场景 11（月末积压）：健康信号短暂恢复 → 探测上限 + 保守恢复。
+     * 单次恢复信号不被追认（需连续确认）；探测严格在预算上限内；
+     * 确认恢复后从下限保守爬坡，不一步恢复全量。
+     */
+    private ScenarioResult monthEndConservativeRecovery() {
+        ScenarioResult s = new ScenarioResult("month-end-conservative-recovery");
+        reset();
+        s.step("待遇规则服务持续超时（模拟器 TIMEOUT），登记 3 笔月末医院清单");
+        simulator.setRuleMode(DownstreamSimulator.RuleMode.TIMEOUT);
+        for (int i = 1; i <= 3; i++) {
+            regMonthEnd("ME-CR-" + i, SourceType.HOSPITAL, "20000.00", null);
+        }
+        s.step("周期1：3 次尝试全部瞬时失败（退避 1s）");
+        scheduler.tick();
+        s.step("等待退避（1.1s）后周期2-3：继续失败，降级编排器将 RULE_ENGINE 降为 DEGRADED");
+        sleep(1100);
+        scheduler.tick();
+        scheduler.tick();
+        s.check(profileService.get(TaskRegistrar.DEP_RULE).getState() == ProfileState.DEGRADED,
+                "连续失败 2 个周期后画像降级 DEGRADED，实际=" + profileService.get(TaskRegistrar.DEP_RULE).getState());
+        s.step("等待退避（2.1s）后周期4：再次失败，编排器熔断为 DOWN（生效上限 0、冻结桶）");
+        sleep(2100);
+        scheduler.tick();
+        scheduler.tick();
+        s.check(profileService.get(TaskRegistrar.DEP_RULE).getState() == ProfileState.DOWN,
+                "连续失败 3 个周期后画像熔断 DOWN，实际=" + profileService.get(TaskRegistrar.DEP_RULE).getState());
+        s.check(bucketService.get(TaskRegistrar.DEP_RULE).isFrozen(), "RULE 桶已冻结");
+
+        s.step("故障期第 1 个探测周期：探测失败（模拟器仍 TIMEOUT）");
+        scheduler.tick();
+        s.step("健康信号短暂恢复：接口仅恢复 1 个探测周期后再次超时");
+        simulator.setRuleMode(DownstreamSimulator.RuleMode.NORMAL);
+        scheduler.tick();
+        simulator.setRuleMode(DownstreamSimulator.RuleMode.TIMEOUT);
+        scheduler.tick();
+        CapacityProfile afterBlip = profileService.get(TaskRegistrar.DEP_RULE);
+        s.check(afterBlip.getState() == ProfileState.DOWN && afterBlip.getEffectiveCeiling() == 0,
+                "保守恢复：单次恢复信号不被追认，画像保持 DOWN、生效上限 0，实际=" + afterBlip.getState());
+        s.check(bucketService.get(TaskRegistrar.DEP_RULE).isFrozen()
+                && bucketService.get(TaskRegistrar.DEP_RULE).getRefillPerTick() == 0,
+                "短暂恢复期间桶保持冻结、零补充（未放开）");
+        s.check(afterBlip.getTotalProbes() == 3,
+                "探测上限：3 个故障周期每周期恰好 1 次探测（上限 1/依赖/周期），实际=" + afterBlip.getTotalProbes());
+        long probeEvents = capacityEventRepository.findAll().stream()
+                .filter(e -> e.getDependencyCode().equals(TaskRegistrar.DEP_RULE))
+                .filter(e -> e.getEventType() == CapacityEventType.PROBE_OK
+                        || e.getEventType() == CapacityEventType.PROBE_FAIL)
+                .count();
+        s.check(probeEvents == 3, "探测审计：3 条探测事件（2 失败 + 1 成功），实际=" + probeEvents);
+        s.check(capacityEventRepository.findAll().stream()
+                .noneMatch(e -> e.getEventType() == CapacityEventType.RECOVERY_STARTED),
+                "短暂恢复未触发任何恢复爬坡（无 RECOVERY_STARTED 事件）");
+
+        s.step("接口持续恢复健康：连续探测确认后进入保守爬坡");
+        simulator.setRuleMode(DownstreamSimulator.RuleMode.NORMAL);
+        scheduler.tick();
+        scheduler.tick();
+        CapacityProfile recovering = profileService.get(TaskRegistrar.DEP_RULE);
+        s.check(recovering.getState() == ProfileState.RECOVERING && recovering.getEffectiveCeiling() == 1,
+                "连续 2 次探测成功进入恢复爬坡：生效上限从 1/周期起步（声明上限 2），实际="
+                        + recovering.getState() + "/" + recovering.getEffectiveCeiling());
+        s.check(bucketService.get(TaskRegistrar.DEP_RULE).getRefillPerTick() == 1,
+                "爬坡期间桶补充速率 1/周期（不一步恢复全量），实际="
+                        + bucketService.get(TaskRegistrar.DEP_RULE).getRefillPerTick());
+        s.step("再稳定 1 个周期：爬坡到达声明上限，恢复 NORMAL");
+        scheduler.tick();
+        CapacityProfile recovered = profileService.get(TaskRegistrar.DEP_RULE);
+        s.check(recovered.getState() == ProfileState.NORMAL
+                && recovered.getEffectiveCeiling() == recovered.getDeclaredCeiling(),
+                "爬坡到达声明上限后恢复 NORMAL（全程未越过声明上限），实际=" + recovered.getState() + "/"
+                        + recovered.getEffectiveCeiling());
+        s.check(capacityEventRepository.findAll().stream()
+                .anyMatch(e -> e.getEventType() == CapacityEventType.RECOVERED),
+                "容量事件审计记录完整恢复轨迹（RECOVERED）");
+        s.step("等待退避窗口（4.5s）后继续调度直至全部完成");
+        sleep(4500);
+        tickUntil(15, () -> taskRepository.findAll().stream()
+                .allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED));
+        s.check(taskRepository.findAll().stream().allMatch(t -> t.getStatus() == TaskStatus.CONFIRMED),
+                "恢复后全部任务最终 CONFIRMED");
+        return s;
+    }
+
     // ---------- 工具 ----------
 
     private ClearingTask reg(String key, String version, SourceType source, String amount, String payload) {
         return registrar.register("BATCH-" + key, CLEARING_DATE, key, version, source,
                 new BigDecimal(amount), payload).task();
+    }
+
+    /** 月末场景登记：清算日为月末，可显式指定截止时间 */
+    private ClearingTask regMonthEnd(String key, SourceType source, String amount, Instant deadlineAt) {
+        return registrar.register("BATCH-" + key, MONTH_END, key, "v1", source,
+                new BigDecimal(amount), payload("A-001", 1, "10.00"), deadlineAt).task();
+    }
+
+    private ClearingTask taskOf(String businessKey) {
+        return taskRepository.findAll().stream()
+                .filter(t -> t.getBusinessKey().equals(businessKey))
+                .findFirst().orElseThrow();
+    }
+
+    /** 已完成待遇计算（阶段已离开 CALC：RETURN 或 DONE）的任务数 */
+    private long countByPrefixCalcDone(String keyPrefix) {
+        return taskRepository.findAll().stream()
+                .filter(t -> t.getBusinessKey().startsWith(keyPrefix))
+                .filter(t -> t.getStage() != Stage.CALC)
+                .count();
+    }
+
+    private String latestPeriodLabel() {
+        return quotaRepository.findAll().stream()
+                .map(QuotaGrant::getPeriodLabel)
+                .max(String::compareTo)
+                .orElse("");
     }
 
     private static String payload(String code, int qty, String price) {

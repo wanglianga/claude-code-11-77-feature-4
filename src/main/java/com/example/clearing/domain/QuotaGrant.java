@@ -38,9 +38,21 @@ public class QuotaGrant {
     @Column(name = "demand", nullable = false)
     private int demand;
 
-    /** 本周期授予的尝试令牌数 */
+    /** 本周期授予的尝试令牌数（= 保留份额授予 + 公共池授予） */
     @Column(name = "granted", nullable = false)
     private int granted;
+
+    /** 其中：每来源最低服务份额（保留份额）内授予的数量 */
+    @Column(name = "reserved_granted", nullable = false)
+    private int reservedGranted = 0;
+
+    /** 其中：公共池按风险分排序授予（可追溯插队）的数量 */
+    @Column(name = "bonus_granted", nullable = false)
+    private int bonusGranted = 0;
+
+    /** 该组本周期见到的最高截止风险分（可追溯优先级的证据） */
+    @Column(name = "max_risk_score", nullable = false)
+    private double maxRiskScore = 0.0;
 
     @Column(name = "period_label", nullable = false, length = 64)
     private String periodLabel;
@@ -97,6 +109,30 @@ public class QuotaGrant {
 
     public void setGranted(int granted) {
         this.granted = granted;
+    }
+
+    public int getReservedGranted() {
+        return reservedGranted;
+    }
+
+    public void setReservedGranted(int reservedGranted) {
+        this.reservedGranted = reservedGranted;
+    }
+
+    public int getBonusGranted() {
+        return bonusGranted;
+    }
+
+    public void setBonusGranted(int bonusGranted) {
+        this.bonusGranted = bonusGranted;
+    }
+
+    public double getMaxRiskScore() {
+        return maxRiskScore;
+    }
+
+    public void setMaxRiskScore(double maxRiskScore) {
+        this.maxRiskScore = maxRiskScore;
     }
 
     public String getPeriodLabel() {

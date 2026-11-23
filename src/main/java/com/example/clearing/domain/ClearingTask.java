@@ -75,6 +75,18 @@ public class ClearingTask {
     @Column(name = "priority", nullable = false)
     private int priority;
 
+    /** 清算截止时间（截止风险估计器输入；缺省为清算日当日截止时刻） */
+    @Column(name = "deadline_at")
+    private Instant deadlineAt;
+
+    /** 截止风险估计器输出的风险分（金额权重 × 临期系数），调度按分排序，可追溯 */
+    @Column(name = "risk_score", nullable = false)
+    private double riskScore = 0.0;
+
+    /** 风险带：CRITICAL / HIGH / MEDIUM / LOW */
+    @Column(name = "risk_band", length = 16)
+    private String riskBand;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 24)
     private TaskStatus status = TaskStatus.REGISTERED;
@@ -192,6 +204,30 @@ public class ClearingTask {
 
     public void setPriority(int priority) {
         this.priority = priority;
+    }
+
+    public Instant getDeadlineAt() {
+        return deadlineAt;
+    }
+
+    public void setDeadlineAt(Instant deadlineAt) {
+        this.deadlineAt = deadlineAt;
+    }
+
+    public double getRiskScore() {
+        return riskScore;
+    }
+
+    public void setRiskScore(double riskScore) {
+        this.riskScore = riskScore;
+    }
+
+    public String getRiskBand() {
+        return riskBand;
+    }
+
+    public void setRiskBand(String riskBand) {
+        this.riskBand = riskBand;
     }
 
     public TaskStatus getStatus() {

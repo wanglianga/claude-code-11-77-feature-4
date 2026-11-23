@@ -40,11 +40,13 @@ public class TaskController {
         this.manualResolution = manualResolution;
     }
 
-    @Operation(summary = "登记清算任务", description = "同业务键+同版本+同内容幂等吸收；同业务键+同版本+不同内容生成内容冲突，不发放令牌")
+    @Operation(summary = "登记清算任务", description = "同业务键+同版本+同内容幂等吸收；同业务键+同版本+不同内容生成内容冲突，不发放令牌；"
+            + "可显式指定清算截止时间 deadlineAt 供截止风险估计")
     @PostMapping
     public TaskRegistrar.RegisterResult register(@Valid @RequestBody RegisterTaskRequest request) {
         return registrar.register(request.batchId(), request.clearingDate(), request.businessKey(),
-                request.billVersion(), request.sourceType(), request.amount(), request.payload());
+                request.billVersion(), request.sourceType(), request.amount(), request.payload(),
+                request.deadlineAt());
     }
 
     @Operation(summary = "任务列表")
